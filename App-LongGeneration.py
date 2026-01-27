@@ -1,6 +1,7 @@
 import gradio as gr
 import os
 from pathlib import Path
+import random
 import warnings
 import time
 import re
@@ -12,6 +13,18 @@ from rich import print as printr
 from rich.console import Console
 
 console = Console()
+
+
+def set_seed(seed: int):
+    """Sets the random seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def chunk_text(text, audio_prompt_text):
     """Split text into speaker-aware chunks based on [S1] and [S2] tags.
@@ -152,6 +165,7 @@ def generate_audio(
     temperature=1.3, 
     top_p=0.95, 
     cfg_filter_top_k=30,
+    seed=None,
     audio_prompt=None,
     text_prompt="",
     progress=gr.Progress()
@@ -182,6 +196,15 @@ def generate_audio(
     chunks = chunk_text(dialogue_text, audio_prompt_text)
     output.append(f"Split text into {len(chunks)} chunks")
     
+    # Set and Display Generation Seed
+    if seed is None or seed < 0:
+        seed = random.randint(0, 2**32 - 1)
+        output.append(f"No seed provided, generated random seed: {seed}")
+    else:
+        seed = int(seed)
+        output.append(f"Using user-selected seed: {seed}")
+    set_seed(seed)
+    
     # Load model
     output.append(f"Loading Dia model from {model_name}...")
     progress(0.1, desc="Loading model")
@@ -191,7 +214,7 @@ def generate_audio(
         output.append(f"Model loaded in {time.time() - start_time:.2f} seconds")
     except Exception as e:
         output.append(f"Error loading model: {e}")
-        return "\n".join(output), None
+        return "\n".join(output), None, None
     
     # Set up arguments
     args = Args(
@@ -271,7 +294,7 @@ def generate_audio(
     
     if not all_audio:
         output.append("Error: No audio was generated")
-        return "\n".join(output), None
+        return "\n".join(output), None, seed
     
     # Concatenate and save the final output
     final_audio = np.concatenate(all_audio)
@@ -287,7 +310,7 @@ def generate_audio(
     output.append(f"Done! Total processing time: {minutes} minutes and {seconds} seconds")
     
     progress(1.0, desc="Processing complete")
-    return "\n".join(output), str(output_file)
+    return "\n".join(output), str(output_file), seed
 
 # Create the Gradio interface
 with gr.Blocks(title="Dia TTS - Dialogue Text to Speech") as app:
@@ -368,6 +391,14 @@ with gr.Blocks(title="Dia TTS - Dialogue Text to Speech") as app:
                     step=5, 
                     label="CFG Filter Top K"
                 )
+                seed_input = gr.Number(
+                    label="Generation Seed (Optional)",
+                    value=-1,
+                    precision=0,
+                    step=1,
+                    interactive=True,
+                    info="Set a generation seed for reproducible outputs. Leave empty or -1 for random seed."
+                )
             
             with gr.Group():
                 gr.Markdown("### Voice Cloning (Optional)")
@@ -392,6 +423,7 @@ with gr.Blocks(title="Dia TTS - Dialogue Text to Speech") as app:
             with gr.Group():
                 output_log = gr.Textbox(label="Processing Log", lines=10)
                 output_audio = gr.Audio(label="Generated Audio")
+                seed_output = gr.Textbox(label="Generation Seed", interactive=False)
     
     # Set up the generation function
     inputs = [
@@ -404,11 +436,12 @@ with gr.Blocks(title="Dia TTS - Dialogue Text to Speech") as app:
         temperature, 
         top_p, 
         cfg_filter_top_k,
+        seed_input,
         audio_prompt,
         text_prompt
     ]
     
-    outputs = [output_log, output_audio]
+    outputs = [output_log, output_audio, seed_output]
     
     generate_button.click(
         fn=generate_audio, 
