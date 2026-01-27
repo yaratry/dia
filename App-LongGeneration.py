@@ -2,6 +2,7 @@ import gradio as gr
 import os
 from pathlib import Path
 import random
+import tempfile
 import warnings
 import time
 import re
@@ -172,145 +173,197 @@ def generate_audio(
 ):
     """Main function to generate audio from text for the Gradio interface."""
     output = []
+    temp_audio_prompt_path = None  # Track temp file for cleanup
     
-    # Setup device
-    device = detect_device()
-    output.append(f"Using device: {device}")
-    
-    # Create a directory to save chunks
-    app_dir = Path(__file__).parent
-    chunks_dir = app_dir / "audio_chunks"
-    os.makedirs(chunks_dir, exist_ok=True)
-    
-    # Check if audio prompt and text prompt are both provided
-    if audio_prompt is not None and audio_prompt != "" and text_prompt != "":
-        audio_prompt_text = text_prompt
-    else:
-        if audio_prompt is not None and audio_prompt != "" and text_prompt == "":
-            output.append("Warning: Text prompt is required when using an audio prompt. Voice cloning disabled.")
-        text_prompt = ""
-        audio_prompt_text = ""
-        audio_prompt = None
-    
-    # Split text into chunks
-    chunks = chunk_text(dialogue_text, audio_prompt_text)
-    output.append(f"Split text into {len(chunks)} chunks")
-    
-    # Set and Display Generation Seed
-    if seed is None or seed < 0:
-        seed = random.randint(0, 2**32 - 1)
-        output.append(f"No seed provided, generated random seed: {seed}")
-    else:
-        seed = int(seed)
-        output.append(f"Using user-selected seed: {seed}")
-    set_seed(seed)
-    
-    # Load model
-    output.append(f"Loading Dia model from {model_name}...")
-    progress(0.1, desc="Loading model")
-    start_time = time.time()
     try:
-        model = Dia.from_pretrained(model_name, compute_dtype="float16", device=device)
-        output.append(f"Model loaded in {time.time() - start_time:.2f} seconds")
-    except Exception as e:
-        output.append(f"Error loading model: {e}")
-        return "\n".join(output), None, None
+        # Setup device
+        device = detect_device()
+        output.append(f"Using device: {device}")
+        
+        # Create a directory to save chunks
+        app_dir = Path(__file__).parent
+        chunks_dir = app_dir / "audio_chunks"
+        os.makedirs(chunks_dir, exist_ok=True)
+        
+        # Process audio prompt if provided
+        prompt_path_for_generate = None
+        if audio_prompt is not None and text_prompt != "":
+            sr, audio_data = audio_prompt
+            # Check if audio_data is valid
+            if audio_data is None or audio_data.size == 0 or audio_data.max() == 0:
+                output.append("Warning: Audio prompt seems empty or silent, ignoring prompt.")
+                audio_prompt_text = ""
+            else:
+                # Save prompt audio to a temporary WAV file with preprocessing
+                with tempfile.NamedTemporaryFile(mode="wb", suffix=".wav", delete=False) as f_audio:
+                    temp_audio_prompt_path = f_audio.name
+                    
+                    # Convert to float32 in [-1, 1] range if integer type
+                    if np.issubdtype(audio_data.dtype, np.integer):
+                        max_val = np.iinfo(audio_data.dtype).max
+                        audio_data = audio_data.astype(np.float32) / max_val
+                    elif not np.issubdtype(audio_data.dtype, np.floating):
+                        output.append(f"Warning: Unsupported audio prompt dtype {audio_data.dtype}, attempting conversion.")
+                        try:
+                            audio_data = audio_data.astype(np.float32)
+                        except Exception as conv_e:
+                            output.append(f"Error: Failed to convert audio prompt to float32: {conv_e}")
+                            return "\n".join(output), None, None
+                    
+                    # Ensure mono (average channels if stereo)
+                    if audio_data.ndim > 1:
+                        if audio_data.shape[0] == 2:  # Assume (2, N)
+                            audio_data = np.mean(audio_data, axis=0)
+                        elif audio_data.shape[1] == 2:  # Assume (N, 2)
+                            audio_data = np.mean(audio_data, axis=1)
+                        else:
+                            output.append(f"Warning: Audio prompt has unexpected shape {audio_data.shape}, taking first channel.")
+                            audio_data = audio_data[0] if audio_data.shape[0] < audio_data.shape[1] else audio_data[:, 0]
+                        audio_data = np.ascontiguousarray(audio_data)
+                    
+                    # Write using soundfile with FLOAT subtype
+                    try:
+                        sf.write(temp_audio_prompt_path, audio_data, sr, subtype="FLOAT")
+                        prompt_path_for_generate = temp_audio_prompt_path
+                        output.append(f"Processed audio prompt (sample rate: {sr})")
+                    except Exception as write_e:
+                        output.append(f"Error writing temporary audio file: {write_e}")
+                        return "\n".join(output), None, None
+                
+                audio_prompt_text = text_prompt
+        else:
+            if audio_prompt is not None and text_prompt == "":
+                output.append("Warning: Text prompt is required when using an audio prompt. Voice cloning disabled.")
+            audio_prompt_text = ""
     
-    # Set up arguments
-    args = Args(
-        tokens_per_chunk=tokens_per_chunk,
-        cfg_scale=cfg_scale,
-        temperature=temperature,
-        top_p=top_p,
-        cfg_filter_top_k=cfg_filter_top_k,
-        speed=speed,
-        silence=silence
-    )
+        # Split text into chunks
+        chunks = chunk_text(dialogue_text, audio_prompt_text)
+        output.append(f"Split text into {len(chunks)} chunks")
     
-    # Generate audio for each chunk
-    tmp_files = []
-    output.append(f"Generating audio for each chunk...")
-    total_start = time.time()
-    
-    for i, (chunk, silence_flag) in enumerate(chunks):
-        chunk_file = chunks_dir / f"chunk_{i:03d}.wav"
-        tmp_files.append(chunk_file)
+        # Set and Display Generation Seed
+        if seed is None or seed < 0:
+            seed = random.randint(0, 2**32 - 1)
+            output.append(f"No seed provided, generated random seed: {seed}")
+        else:
+            seed = int(seed)
+            output.append(f"Using user-selected seed: {seed}")
+        set_seed(seed)
         
-        # Update progress
-        progress((i / len(chunks)) * 0.8 + 0.1, desc=f"Processing chunk {i+1}/{len(chunks)}")
-        
-        # Print chunk info
-        output.append(f"\nChunk {i+1}/{len(chunks)}")
-        
-        if not silence_flag:
-            output.append("Silence removed due to [...] detected at the end of the chunk")
-        
-        # Show a preview of the chunk
-        chunk_preview = chunk[:200]
-        if len(chunk) > 200:
-            chunk_preview += " [...]"
-        output.append(f"{'='*40}\n{chunk_preview}\n{'='*40}")
-        
-        # Generate audio for this chunk
+        # Load model
+        output.append(f"Loading Dia model from {model_name}...")
+        progress(0.1, desc="Loading model")
         start_time = time.time()
         try:
-            # Audio generation with retry logic
-            audio = generate_with_retry(model, chunk, audio_prompt, args)
-            
-            # Apply speed adjustment
-            if speed != 1.0:
-                orig_len = len(audio)
-                target_len = int(orig_len / speed)
-                x_orig = np.arange(orig_len)
-                x_new = np.linspace(0, orig_len-1, target_len)
-                audio = np.interp(x_new, x_orig, audio)
-            
-            # Add silence at the end of the audio fragment
-            if silence > 0 and silence_flag:
-                audio = add_silence(audio, silence)
-            
-            # Save chunk file
-            sf.write(chunk_file, audio, 44100)
-            
-            # Generation statistics
-            minutes, seconds = get_duration(start_time)
-            if minutes > 0:
-                output.append(f"Generated chunk {i+1} (duration: {len(audio)/44100:.2f} seconds) - Processed in {minutes} minutes and {seconds} seconds")
-            else:
-                output.append(f"Generated chunk {i+1} (duration: {len(audio)/44100:.2f} seconds) - Processed in {seconds} seconds")
-        
+            model = Dia.from_pretrained(model_name, compute_dtype="float16", device=device)
+            output.append(f"Model loaded in {time.time() - start_time:.2f} seconds")
         except Exception as e:
-            output.append(f"Error processing chunk {i+1}: {e}")
+            output.append(f"Error loading model: {e}")
+            return "\n".join(output), None, None
     
-    # Combine all audio files
-    progress(0.9, desc="Combining audio segments")
-    output.append(f"Combining {len(tmp_files)} audio segments...")
-    all_audio = []
+        # Set up arguments
+        args = Args(
+            tokens_per_chunk=tokens_per_chunk,
+            cfg_scale=cfg_scale,
+            temperature=temperature,
+            top_p=top_p,
+            cfg_filter_top_k=cfg_filter_top_k,
+            speed=speed,
+            silence=silence
+        )
+        
+        # Generate audio for each chunk
+        tmp_files = []
+        output.append(f"Generating audio for each chunk...")
+        total_start = time.time()
+        
+        for i, (chunk, silence_flag) in enumerate(chunks):
+            chunk_file = chunks_dir / f"chunk_{i:03d}.wav"
+            tmp_files.append(chunk_file)
+            
+            # Update progress
+            progress((i / len(chunks)) * 0.8 + 0.1, desc=f"Processing chunk {i+1}/{len(chunks)}")
+            
+            # Print chunk info
+            output.append(f"\nChunk {i+1}/{len(chunks)}")
+            
+            if not silence_flag:
+                output.append("Silence removed due to [...] detected at the end of the chunk")
+            
+            # Show a preview of the chunk
+            chunk_preview = chunk[:200]
+            if len(chunk) > 200:
+                chunk_preview += " [...]"
+            output.append(f"{'='*40}\n{chunk_preview}\n{'='*40}")
+            
+            # Generate audio for this chunk
+            start_time = time.time()
+            try:
+                # Audio generation with retry logic - use preprocessed prompt path
+                audio = generate_with_retry(model, chunk, prompt_path_for_generate, args)
+                
+                # Apply speed adjustment
+                if speed != 1.0:
+                    orig_len = len(audio)
+                    target_len = int(orig_len / speed)
+                    x_orig = np.arange(orig_len)
+                    x_new = np.linspace(0, orig_len-1, target_len)
+                    audio = np.interp(x_new, x_orig, audio)
+                
+                # Add silence at the end of the audio fragment
+                if silence > 0 and silence_flag:
+                    audio = add_silence(audio, silence)
+                
+                # Save chunk file
+                sf.write(chunk_file, audio, 44100)
+                
+                # Generation statistics
+                minutes, seconds = get_duration(start_time)
+                if minutes > 0:
+                    output.append(f"Generated chunk {i+1} (duration: {len(audio)/44100:.2f} seconds) - Processed in {minutes} minutes and {seconds} seconds")
+                else:
+                    output.append(f"Generated chunk {i+1} (duration: {len(audio)/44100:.2f} seconds) - Processed in {seconds} seconds")
+            
+            except Exception as e:
+                output.append(f"Error processing chunk {i+1}: {e}")
     
-    for tmp_file in tmp_files:
-        if tmp_file.exists():
-            audio, sr = sf.read(tmp_file)
-            all_audio.append(audio)
+        # Combine all audio files
+        progress(0.9, desc="Combining audio segments")
+        output.append(f"Combining {len(tmp_files)} audio segments...")
+        all_audio = []
+        
+        for tmp_file in tmp_files:
+            if tmp_file.exists():
+                audio, sr = sf.read(tmp_file)
+                all_audio.append(audio)
+        
+        if not all_audio:
+            output.append("Error: No audio was generated")
+            return "\n".join(output), None, seed
+        
+        # Concatenate and save the final output
+        final_audio = np.concatenate(all_audio)
+        
+        # Create final output file
+        output_dir = app_dir / "output"
+        os.makedirs(output_dir, exist_ok=True)
+        output_file = output_dir / "final_output.wav"
+        output.append(f"Saving final audio (duration: {len(final_audio)/44100:.2f} seconds)")
+        sf.write(output_file, final_audio, 44100)
+        
+        minutes, seconds = get_duration(total_start)
+        output.append(f"Done! Total processing time: {minutes} minutes and {seconds} seconds")
+        
+        progress(1.0, desc="Processing complete")
+        return "\n".join(output), str(output_file), seed
     
-    if not all_audio:
-        output.append("Error: No audio was generated")
-        return "\n".join(output), None, seed
-    
-    # Concatenate and save the final output
-    final_audio = np.concatenate(all_audio)
-    
-    # Create final output file
-    output_dir = app_dir / "output"
-    os.makedirs(output_dir, exist_ok=True)
-    output_file = output_dir / "final_output.wav"
-    output.append(f"Saving final audio (duration: {len(final_audio)/44100:.2f} seconds)")
-    sf.write(output_file, final_audio, 44100)
-    
-    minutes, seconds = get_duration(total_start)
-    output.append(f"Done! Total processing time: {minutes} minutes and {seconds} seconds")
-    
-    progress(1.0, desc="Processing complete")
-    return "\n".join(output), str(output_file), seed
+    finally:
+        # Cleanup temporary audio prompt file
+        if temp_audio_prompt_path and Path(temp_audio_prompt_path).exists():
+            try:
+                Path(temp_audio_prompt_path).unlink()
+                print(f"Deleted temporary audio prompt file: {temp_audio_prompt_path}")
+            except OSError as e:
+                print(f"Warning: Error deleting temporary audio prompt file {temp_audio_prompt_path}: {e}")
 
 # Create the Gradio interface
 with gr.Blocks(title="Dia TTS - Dialogue Text to Speech") as app:
@@ -404,8 +457,9 @@ with gr.Blocks(title="Dia TTS - Dialogue Text to Speech") as app:
                 gr.Markdown("### Voice Cloning (Optional)")
                 with gr.Row():
                     audio_prompt = gr.Audio(
-                        type="filepath", 
-                        label="Audio Prompt for Voice Cloning"
+                        label="Audio Prompt for Voice Cloning",
+                        sources=["upload", "microphone"],
+                        type="numpy"
                     )
                 text_prompt = gr.Textbox(
                     placeholder="Enter text that matches the audio prompt...", 
