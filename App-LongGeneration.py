@@ -388,7 +388,7 @@ with gr.Blocks(title="Dia TTS - Dialogue Text to Speech") as app:
             with gr.Group():
                 gr.Markdown("### Model Settings")
                 model_name = gr.Dropdown(
-                    choices=["nari-labs/Dia-1.6B", "nari-labs/Dia-1.6B-0626"], 
+                    choices=["nari-labs/Dia-1.6B"], 
                     value="nari-labs/Dia-1.6B", 
                     label="Model"
                 )
